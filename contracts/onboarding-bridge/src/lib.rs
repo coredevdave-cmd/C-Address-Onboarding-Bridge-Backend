@@ -23,6 +23,11 @@ pub enum DataKey {
     // Amount constraints
     MinAmount,
     MaxAmount,
+    // Volume-based rebate tiers
+    UserVolume(Address),
+    TierThreshold(u32),
+    TierDiscount(u32),
+    TierCount,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +117,37 @@ fn assert_op_ready(env: &Env, label: &str) {
     );
 }
 
+/// Returns the best rebate discount in bps for the user's cumulative volume.
+fn rebate_bps(env: &Env, user: &Address) -> u32 {
+    let volume: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::UserVolume(user.clone()))
+        .unwrap_or(0);
+    let tier_count: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TierCount)
+        .unwrap_or(0);
+    let mut best: u32 = 0;
+    for i in 0..tier_count {
+        let threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierThreshold(i))
+            .unwrap_or(0);
+        let discount: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierDiscount(i))
+            .unwrap_or(0);
+        if volume >= threshold && discount > best {
+            best = discount;
+        }
+    }
+    best
+}
+
 // ---------------------------------------------------------------------------
 // Contract implementation
 // ---------------------------------------------------------------------------
@@ -135,6 +171,7 @@ impl OnboardingBridge {
         env.storage().instance().set(&DataKey::MinAmount, &min_amount);
         env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::TierCount, &0u32);
         env.storage().instance().set(&DataKey::Version, &2u32);
         env.events()
             .publish((Symbol::new(&env, "initialize"),), (admin, fee_bps));
@@ -184,6 +221,17 @@ impl OnboardingBridge {
 
     pub fn max_amount(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::MaxAmount).unwrap_or(i128::MAX)
+    }
+
+    pub fn user_volume(env: Env, user: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UserVolume(user))
+            .unwrap_or(0)
+    }
+
+    pub fn rebate_for(env: Env, user: Address) -> u32 {
+        rebate_bps(&env, &user)
     }
 
     pub fn pending_op(env: Env, hash: BytesN<32>) -> Option<PendingOperation> {
@@ -306,6 +354,36 @@ impl OnboardingBridge {
     }
 
     // -----------------------------------------------------------------------
+    // Volume rebate tiers (admin-configurable)
+    // -----------------------------------------------------------------------
+
+    /// Set or update a rebate tier. discount_bps is capped at 5000 (50%).
+    pub fn set_rebate_tier(env: Env, tier_index: u32, threshold: i128, discount_bps: u32) {
+        require_admin(&env);
+        assert!(discount_bps <= 5000, "discount capped at 50%");
+        env.storage()
+            .instance()
+            .set(&DataKey::TierThreshold(tier_index), &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::TierDiscount(tier_index), &discount_bps);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierCount)
+            .unwrap_or(0);
+        if tier_index >= count {
+            env.storage()
+                .instance()
+                .set(&DataKey::TierCount, &(tier_index + 1));
+        }
+        env.events().publish(
+            (Symbol::new(&env, "tier_set"),),
+            (tier_index, threshold, discount_bps),
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Core: fund via SAC token transfer
     // -----------------------------------------------------------------------
 
@@ -326,8 +404,10 @@ impl OnboardingBridge {
         assert!(amount <= max, "amount above maximum");
 
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-        let fee_amount = if fee_bps > 0 {
-            (amount * fee_bps as i128) / 10000
+        let discount = rebate_bps(&env, &source);
+        let effective_fee_bps = fee_bps.saturating_sub(fee_bps * discount / 10000);
+        let fee_amount = if effective_fee_bps > 0 {
+            (amount * effective_fee_bps as i128) / 10000
         } else {
             0i128
         };
@@ -345,9 +425,14 @@ impl OnboardingBridge {
             env.storage().instance().set(&key, &(acc + fee_amount));
         }
 
+        // Update cumulative volume for rebate tracking
+        let vol_key = DataKey::UserVolume(source.clone());
+        let vol: i128 = env.storage().instance().get(&vol_key).unwrap_or(0);
+        env.storage().instance().set(&vol_key, &(vol + amount));
+
         env.events().publish(
             (Symbol::new(&env, "funded"),),
-            (source, target, amount, fee_amount, memo),
+            (source, target, amount, fee_amount, discount, memo),
         );
         fee_amount
     }

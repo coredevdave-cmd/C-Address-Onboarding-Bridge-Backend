@@ -335,3 +335,54 @@ fn test_execute_set_max_after_timelock() {
     s.bridge.execute_set_max(&5000, &label);
     assert_eq!(s.bridge.max_amount(), 5000);
 }
+
+// ---------------------------------------------------------------------------
+// Volume-based fee rebate tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rebate_tiers() {
+    let s = setup(1000, 0); // 10% base fee
+
+    // Tier 0: volume >= 1000 → 10% discount off the fee
+    // Tier 1: volume >= 5000 → 25% discount
+    s.bridge.set_rebate_tier(&0, &1000i128, &1000u32);
+    s.bridge.set_rebate_tier(&1, &5000i128, &2500u32);
+
+    let source = Address::generate(&s.env);
+    let target = Address::generate(&s.env);
+    s.token.mint(&source, &20_000);
+    let m = |l: &str| String::from_str(&s.env, l);
+
+    // Tx1: 500, volume=0 → no rebate; fee = 500*1000/10000 = 50
+    assert_eq!(s.bridge.fund_c_address(&source, &target, &s.token.address, &500, &m("t1")), 50);
+    assert_eq!(s.bridge.user_volume(&source), 500);
+
+    // Tx2: 600, volume=500 → no tier; fee = 60
+    assert_eq!(s.bridge.fund_c_address(&source, &target, &s.token.address, &600, &m("t2")), 60);
+    assert_eq!(s.bridge.user_volume(&source), 1100);
+
+    // Tx3: 4000, volume=1100 → tier0 (10% discount)
+    // effective_fee_bps = 1000 - 1000*1000/10000 = 900; fee = 4000*900/10000 = 360
+    assert_eq!(s.bridge.fund_c_address(&source, &target, &s.token.address, &4000, &m("t3")), 360);
+    assert_eq!(s.bridge.user_volume(&source), 5100);
+
+    // Tx4: 1000, volume=5100 → tier1 (25% discount)
+    // effective_fee_bps = 1000 - 1000*2500/10000 = 750; fee = 1000*750/10000 = 75
+    assert_eq!(s.bridge.fund_c_address(&source, &target, &s.token.address, &1000, &m("t4")), 75);
+}
+
+#[test]
+fn test_rebate_for_view() {
+    let s = setup(1000, 0);
+    s.bridge.set_rebate_tier(&0, &0i128, &500u32); // threshold=0 → everyone qualifies
+    let user = Address::generate(&s.env);
+    assert_eq!(s.bridge.rebate_for(&user), 500);
+}
+
+#[test]
+#[should_panic(expected = "discount capped at 50%")]
+fn test_rebate_tier_cap() {
+    let s = setup(1000, 0);
+    s.bridge.set_rebate_tier(&0, &0i128, &5001u32);
+}
