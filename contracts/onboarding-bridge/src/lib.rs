@@ -1,41 +1,71 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, crypto::Hash, Address, Bytes, BytesN, Env, String,
+    Symbol, Vec,
+};
 
-/// Current on-chain storage schema version. Bump this whenever a storage key
-/// is added, renamed, or its value type changes.
-pub const SCHEMA_VERSION: u32 = 1;
+const TTL_THRESHOLD: u32 = 5000;
+const TTL_EXTEND: u32 = 50000;
 
-/// Structured error type returned by all public functions.
-#[contracterror]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ContractError {
-    /// Contract has already been initialized.
-    AlreadyInitialized = 1,
-    /// Contract has not been initialized yet.
-    NotInitialized = 2,
-    /// Caller is not the contract admin.
-    Unauthorized = 3,
-    /// fee_bps exceeds 10000 (100 %).
-    InvalidFeeBps = 4,
-    /// Transfer amount must be > 0.
-    ZeroAmount = 5,
-    /// Withdrawal would exceed accumulated fees.
-    InsufficientFees = 6,
-    /// On-chain schema version is newer than this code understands.
-    IncompatibleSchema = 7,
-}
+const ERR_INVALID_C_ADDRESS: &str = "invalid c-address: not a contract address";
+const ERR_REENTRANT_CALL: &str = "reentrant call detected";
+const ERR_EMPTY_BATCH: &str = "batch inputs must not be empty";
+const ERR_MISMATCHED_LENGTHS: &str = "batch input vectors must have same length";
+const ERR_NO_ENTRIES_TO_ARCHIVE: &str = "no entries to archive";
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    Admin,
     FeeBps,
+    MaxFeeBps,
     AccumulatedFees,
     /// Logical contract version (user-visible, incremented on each upgrade).
     Version,
-    /// Storage schema version (incremented when keys/types change).
-    SchemaVersion,
+    Paused,
+    Admins,
+    Threshold,
+    ProposalNonce,
+    Proposal(u32),
+    ProposalApproval(u32, Address),
+    ReentrancyGuard,
+    Funding(u32),
+    FundingCount,
+    ArchivedHash(u32),
+    NextArchiveId,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FundingRecord {
+    source: Address,
+    target: Address,
+    token_address: Address,
+    amount: i128,
+    fee: i128,
+    ledger: u32,
+    memo: String,
+    archived: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum ProposalAction {
+    SetFee(u32),
+    WithdrawFees(Address, Address, i128),
+    Pause,
+    Unpause,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Proposal {
+    pub id: u32,
+    pub action: ProposalAction,
+    pub proposer: Address,
+    pub approval_count: u32,
+    pub executed: bool,
+    pub expiry: u32,
 }
 
 #[contract]
@@ -43,73 +73,79 @@ pub struct OnboardingBridge;
 
 #[contractimpl]
 impl OnboardingBridge {
-    // -----------------------------------------------------------------------
-    // Lifecycle
-    // -----------------------------------------------------------------------
+    fn is_contract_address(addr: &Address) -> bool {
+        let s = addr.to_string();
+        let bytes = s.to_bytes();
+        bytes.first() == Some(b'C')
+    }
 
-    pub fn initialize(env: Env, admin: Address, fee_bps: u32) -> Result<(), ContractError> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(ContractError::AlreadyInitialized);
+    fn validate_c_address(target: &Address) {
+        if !Self::is_contract_address(target) {
+            panic!("{}", ERR_INVALID_C_ADDRESS);
         }
-        admin.require_auth();
-        if fee_bps > 10000 {
-            return Err(ContractError::InvalidFeeBps);
+    }
+
+    pub fn is_valid_c_address(_env: Env, target: Address) -> bool {
+        Self::is_contract_address(&target)
+    }
+
+    fn pre_reentrancy_check(env: &Env) {
+        if env.storage().temporary().has(&DataKey::ReentrancyGuard) {
+            panic!("{}", ERR_REENTRANT_CALL);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    fn set_reentrancy_guard(env: &Env) {
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyGuard, &true);
+    }
+
+    fn clear_reentrancy_guard(env: &Env) {
+        env.storage().temporary().remove(&DataKey::ReentrancyGuard);
+    }
+
+    fn extend_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+    }
+
+    pub fn initialize(
+        env: Env,
+        admins: Vec<Address>,
+        threshold: u32,
+        fee_bps: u32,
+        max_fee_bps: u32,
+    ) {
+        if env.storage().instance().has(&DataKey::Version) {
+            panic!("already initialized");
+        }
+        assert!(!admins.is_empty(), "admins must not be empty");
+        assert!(threshold > 0, "threshold must be > 0");
+        assert!(threshold <= admins.len(), "threshold exceeds admin count");
+        assert!(max_fee_bps <= 10000, "max_fee_bps must be <= 10000");
+        assert!(fee_bps <= max_fee_bps, "fee_bps must be <= max_fee_bps");
+
+        env.storage().instance().set(&DataKey::Admins, &admins);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxFeeBps, &max_fee_bps);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::AccumulatedFees, &0i128);
         env.storage().instance().set(&DataKey::Version, &1u32);
-        env.storage().instance().set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
-        env.events().publish((Symbol::new(&env, "initialize"),), (admin, fee_bps));
-        Ok(())
-    }
+        env.storage().instance().set(&DataKey::FundingCount, &0u32);
+        env.storage().instance().set(&DataKey::NextArchiveId, &0u32);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::ProposalNonce, &0u32);
 
-    /// Replace the contract WASM with `new_wasm_hash`.
-    ///
-    /// Only the admin may call this. Storage persists across upgrades.
-    /// After upgrading, call `migrate()` if the new code bumps SCHEMA_VERSION.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ContractError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)?;
-        admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events().publish(
-            (Symbol::new(&env, "upgrade"),),
-            (admin, new_wasm_hash),
+            (Symbol::new(&env, "initialize"),),
+            (admins, threshold, fee_bps, max_fee_bps),
         );
-        Ok(())
-    }
-
-    /// Run after an upgrade when SCHEMA_VERSION has been bumped.
-    ///
-    /// Validates that the on-chain schema version is compatible and writes the
-    /// new schema version. Add field-migration logic here when needed.
-    pub fn migrate(env: Env) -> Result<(), ContractError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)?;
-        admin.require_auth();
-
-        let on_chain: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SchemaVersion)
-            .unwrap_or(1);
-
-        if on_chain > SCHEMA_VERSION {
-            return Err(ContractError::IncompatibleSchema);
-        }
-
-        // Place per-version migration steps here, e.g.:
-        //   if on_chain < 2 { /* rename key X to Y */ }
-
-        env.storage().instance().set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -117,78 +153,94 @@ impl OnboardingBridge {
     // -----------------------------------------------------------------------
 
     pub fn version(env: Env) -> u32 {
+        Self::extend_ttl(&env);
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
     }
 
-    pub fn schema_version(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(0)
-    }
-
-    pub fn admin(env: Env) -> Result<Address, ContractError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)
-    }
-
     pub fn fee_bps(env: Env) -> u32 {
+        Self::extend_ttl(&env);
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    pub fn accumulated_fees(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::AccumulatedFees).unwrap_or(0)
-    }
-
-    // -----------------------------------------------------------------------
-    // Admin operations
-    // -----------------------------------------------------------------------
-
-    pub fn set_fee(env: Env, new_fee_bps: u32) -> Result<(), ContractError> {
-        let admin: Address = env
-            .storage()
+    pub fn max_fee_bps(env: Env) -> u32 {
+        env.storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)?;
-        admin.require_auth();
-        if new_fee_bps > 10000 {
-            return Err(ContractError::InvalidFeeBps);
-        }
-        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-        env.events().publish((Symbol::new(&env, "set_fee"),), (new_fee_bps,));
-        Ok(())
+            .get(&DataKey::MaxFeeBps)
+            .unwrap_or(0)
     }
 
-    // -----------------------------------------------------------------------
-    // Core funding
-    // -----------------------------------------------------------------------
+    pub fn accumulated_fees(env: Env) -> i128 {
+        Self::extend_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0)
+    }
 
-    /// Record a funding event. The caller is responsible for the token transfer.
-    /// Returns the fee amount deducted.
-    ///
-    /// Errors:
-    /// - `ZeroAmount` — amount is 0
-    /// - `NotInitialized` — contract not initialized
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("not initialized")
+    }
+
+    pub fn get_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .expect("not initialized")
+    }
+
     pub fn fund_c_address(
         env: Env,
         source: Address,
         target: Address,
-        _token_address: Address,
+        token_address: Address,
         amount: i128,
-        _memo: String,
-    ) -> Result<i128, ContractError> {
-        source.require_auth();
-        if amount <= 0 {
-            return Err(ContractError::ZeroAmount);
+        memo: String,
+    ) -> i128 {
+        Self::extend_ttl(&env);
+        Self::pre_reentrancy_check(&env);
+        Self::validate_c_address(&target);
+        assert!(amount > 0, "amount must be positive");
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic!("contract is paused");
         }
+        Self::set_reentrancy_guard(&env);
+        let result =
+            Self::fund_c_address_internal(&env, &source, &target, &token_address, amount, &memo);
+        Self::clear_reentrancy_guard(&env);
+        result
+    }
 
+    fn fund_c_address_internal(
+        env: &Env,
+        source: &Address,
+        target: &Address,
+        token_address: &Address,
+        amount: i128,
+        memo: &String,
+    ) -> i128 {
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-        let fee_amount = if fee_bps > 0 {
+        let fee = if fee_bps > 0 {
             (amount * fee_bps as i128) / 10000
         } else {
             0i128
         };
 
-        if fee_amount > 0 {
+        if fee > 0 {
             let accumulated: i128 = env
                 .storage()
                 .instance()
@@ -196,55 +248,84 @@ impl OnboardingBridge {
                 .unwrap_or(0);
             env.storage()
                 .instance()
-                .set(&DataKey::AccumulatedFees, &(accumulated + fee_amount));
+                .set(&DataKey::AccumulatedFees, &(accumulated + fee));
         }
 
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingCount)
+            .unwrap_or(0);
+        let id = count + 1;
+        let record = FundingRecord {
+            source: source.clone(),
+            target: target.clone(),
+            token_address: token_address.clone(),
+            amount,
+            fee,
+            ledger: env.ledger().sequence(),
+            memo: memo.clone(),
+            archived: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Funding(id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Funding(id), TTL_THRESHOLD, TTL_EXTEND);
+        env.storage().instance().set(&DataKey::FundingCount, &id);
+
         env.events().publish(
-            (Symbol::new(&env, "funded"),),
-            (source, target, amount, fee_amount),
+            (Symbol::new(env, "funded"),),
+            (source.clone(), target.clone(), amount, fee),
         );
 
-        Ok(fee_amount)
+        fee
     }
 
-    /// Withdraw accumulated fees. Pass `amount = 0` to withdraw everything.
-    ///
-    /// Errors:
-    /// - `Unauthorized` — caller is not admin
-    /// - `InsufficientFees` — requested amount exceeds balance
-    pub fn withdraw_fees(
+    pub fn batch_fund_c_address(
         env: Env,
-        to: Address,
-        token_address: Address,
-        amount: i128,
-    ) -> Result<i128, ContractError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)?;
-        admin.require_auth();
+        source: Address,
+        targets: Vec<Address>,
+        token_addresses: Vec<Address>,
+        amounts: Vec<i128>,
+        memos: Vec<String>,
+    ) -> (i128, u32) {
+        Self::extend_ttl(&env);
+        Self::pre_reentrancy_check(&env);
+        source.require_auth();
 
-        let accumulated: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AccumulatedFees)
-            .unwrap_or(0);
-        let withdraw_amount = if amount == 0 { accumulated } else { amount };
-        if withdraw_amount > accumulated {
-            return Err(ContractError::InsufficientFees);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::AccumulatedFees, &(accumulated - withdraw_amount));
-
-        env.events().publish(
-            (Symbol::new(&env, "withdrawn"),),
-            (to, token_address, withdraw_amount),
+        let count = targets.len();
+        assert!(count > 0, "{}", ERR_EMPTY_BATCH);
+        assert!(
+            token_addresses.len() == count && amounts.len() == count && memos.len() == count,
+            "{}",
+            ERR_MISMATCHED_LENGTHS
         );
 
-        Ok(withdraw_amount)
+        for i in 0..count {
+            Self::validate_c_address(&targets.get(i).unwrap());
+        }
+
+        Self::set_reentrancy_guard(&env);
+
+        let mut total_fees: i128 = 0;
+        for i in 0..count {
+            let target = targets.get(i).unwrap();
+            let token_addr = token_addresses.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            let memo = memos.get(i).unwrap();
+            total_fees +=
+                Self::fund_c_address_internal(&env, &source, &target, &token_addr, amount, &memo);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_funded"),),
+            (source, count, total_fees),
+        );
+
+        Self::clear_reentrancy_guard(&env);
+        (total_fees, count)
     }
 
     pub fn route_from_exchange(
@@ -254,10 +335,333 @@ impl OnboardingBridge {
         token_address: Address,
         amount: i128,
         memo: String,
-    ) -> Result<i128, ContractError> {
+    ) -> i128 {
+        Self::extend_ttl(&env);
+        Self::pre_reentrancy_check(&env);
+        Self::validate_c_address(&target);
+        assert!(amount > 0, "amount must be positive");
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic!("contract is paused");
+        }
         exchange.require_auth();
-        Self::fund_c_address(env, exchange, target, token_address, amount, memo)
+        Self::fund_c_address_internal(&env, &exchange, &target, &token_address, amount, &memo)
     }
+
+    pub fn funding_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FundingCount)
+            .unwrap_or(0)
+    }
+
+    pub fn funding_record(env: Env, id: u32) -> Option<FundingRecord> {
+        env.storage().persistent().get(&DataKey::Funding(id))
+    }
+
+    pub fn archive_old_entries(env: Env, count: u32) -> BytesN<32> {
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("not initialized");
+        if !admins.is_empty() {
+            admins.get_unchecked(0).require_auth();
+        }
+        Self::extend_ttl(&env);
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingCount)
+            .unwrap_or(0);
+        let archive_count = if count > total { total } else { count };
+        assert!(archive_count > 0, "{}", ERR_NO_ENTRIES_TO_ARCHIVE);
+
+        let mut buf: Vec<i128> = Vec::new(&env);
+        for i in 1..=archive_count {
+            if let Some(mut record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, FundingRecord>(&DataKey::Funding(i))
+            {
+                record.archived = true;
+                buf.push_back(record.amount);
+                buf.push_back(record.fee);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Funding(i), &record);
+            }
+        }
+
+        let archive_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextArchiveId)
+            .unwrap_or(0);
+
+        let mut hash_bytes = Bytes::new(&env);
+        for i in 0..buf.len() {
+            let val = buf.get(i).unwrap();
+            let byte: u8 = (val & 0xFF) as u8;
+            hash_bytes.push_back(byte);
+        }
+        let hash: Hash<32> = env.crypto().sha256(&hash_bytes);
+        let hash_val: BytesN<32> = hash.to_bytes();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArchivedHash(archive_id), &hash_val);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ArchivedHash(archive_id),
+            TTL_THRESHOLD,
+            TTL_EXTEND,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::NextArchiveId, &(archive_id + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "archived"),),
+            (archive_count, hash_val.clone()),
+        );
+
+        hash_val
+    }
+
+    pub fn storage_usage(env: Env) -> (u32, u32, i128, u32) {
+        let funding_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FundingCount)
+            .unwrap_or(0);
+        let archived_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextArchiveId)
+            .unwrap_or(0);
+        let accumulated_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        (funding_count, archived_count, accumulated_fees, 5u32)
+    }
+
+    pub fn propose(env: Env, proposer: Address, action: ProposalAction, expiry_blocks: u32) -> u32 {
+        proposer.require_auth();
+
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("not initialized");
+        assert!(
+            is_admin_in_list(&admins, &proposer),
+            "only admins can propose"
+        );
+        assert!(expiry_blocks >= 10, "expiry must be >= 10 blocks");
+        assert!(expiry_blocks <= 100_000, "expiry must be <= 100000 blocks");
+
+        let nonce: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalNonce)
+            .unwrap_or(0);
+        let proposal_id = nonce + 1;
+        let current_block = env.ledger().sequence();
+
+        let approval_key = DataKey::ProposalApproval(proposal_id, proposer.clone());
+        env.storage().instance().set(&approval_key, &true);
+
+        let proposal = Proposal {
+            id: proposal_id,
+            action,
+            proposer: proposer.clone(),
+            approval_count: 1,
+            executed: false,
+            expiry: current_block + expiry_blocks,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalNonce, &proposal_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposed"),),
+            (proposal_id, proposer, current_block + expiry_blocks),
+        );
+
+        proposal_id
+    }
+
+    pub fn approve(env: Env, admin: Address, proposal_id: u32) {
+        admin.require_auth();
+
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("not initialized");
+        assert!(is_admin_in_list(&admins, &admin), "only admins can approve");
+
+        let mut proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+
+        assert!(
+            env.ledger().sequence() <= proposal.expiry,
+            "proposal expired"
+        );
+        assert!(!proposal.executed, "proposal already executed");
+
+        let approval_key = DataKey::ProposalApproval(proposal_id, admin.clone());
+        assert!(
+            !env.storage().instance().has(&approval_key),
+            "already approved this proposal"
+        );
+        env.storage().instance().set(&approval_key, &true);
+
+        proposal.approval_count += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "approved"),),
+            (proposal_id, admin, proposal.approval_count),
+        );
+    }
+
+    pub fn execute(env: Env, proposal_id: u32) -> i128 {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .expect("not initialized");
+
+        let proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+
+        assert!(
+            env.ledger().sequence() <= proposal.expiry,
+            "proposal expired"
+        );
+        assert!(!proposal.executed, "proposal already executed");
+        assert!(
+            proposal.approval_count >= threshold,
+            "insufficient approvals"
+        );
+
+        let mut executed_proposal = proposal.clone();
+        executed_proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &executed_proposal);
+
+        let result = match proposal.action {
+            ProposalAction::SetFee(new_fee_bps) => {
+                let max_fee: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MaxFeeBps)
+                    .expect("not initialized");
+                assert!(new_fee_bps <= max_fee, "fee exceeds max_fee_bps");
+                env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+                env.events()
+                    .publish((Symbol::new(&env, "set_fee"),), (new_fee_bps,));
+                0i128
+            }
+            ProposalAction::WithdrawFees(to, token, amount) => {
+                let accumulated: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccumulatedFees)
+                    .unwrap_or(0);
+                let withdraw_amount = if amount == 0 { accumulated } else { amount };
+                assert!(
+                    withdraw_amount <= accumulated,
+                    "insufficient accumulated fees"
+                );
+                let remaining = accumulated - withdraw_amount;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccumulatedFees, &remaining);
+                env.events().publish(
+                    (Symbol::new(&env, "withdrawn"),),
+                    (to, token, withdraw_amount),
+                );
+                withdraw_amount
+            }
+            ProposalAction::Pause => {
+                env.storage().instance().set(&DataKey::Paused, &true);
+                env.events().publish((Symbol::new(&env, "paused"),), ());
+                0i128
+            }
+            ProposalAction::Unpause => {
+                env.storage().instance().set(&DataKey::Paused, &false);
+                env.events().publish((Symbol::new(&env, "unpaused"),), ());
+                0i128
+            }
+        };
+
+        env.events()
+            .publish((Symbol::new(&env, "executed"),), (proposal_id,));
+
+        result
+    }
+
+    pub fn get_proposal(env: Env, proposal_id: u32) -> Proposal {
+        env.storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found")
+    }
+
+    pub fn get_active_proposals(env: Env) -> Vec<Proposal> {
+        let nonce: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalNonce)
+            .unwrap_or(0);
+        let current_block = env.ledger().sequence();
+        let mut active: Vec<Proposal> = Vec::new(&env);
+
+        for i in 1..=nonce {
+            if let Some(proposal) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Proposal>(&DataKey::Proposal(i))
+            {
+                if !proposal.executed && current_block <= proposal.expiry {
+                    active.push_back(proposal);
+                }
+            }
+        }
+
+        active
+    }
+}
+
+fn is_admin_in_list(admins: &Vec<Address>, addr: &Address) -> bool {
+    for i in 0..admins.len() {
+        if &admins.get_unchecked(i) == addr {
+            return true;
+        }
+    }
+    false
 }
 
 mod test;
