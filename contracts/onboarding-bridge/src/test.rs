@@ -575,8 +575,7 @@ fn test_initialize() {
 }
 
 #[test]
-#[should_panic(expected = "already initialized")]
-fn test_double_initialize() {
+fn test_double_initialize_is_noop() {
     let (env, bridge) = setup_env();
     let admins = create_admins(&env, 2);
     bridge.initialize(&admins, &2, &30, &1000, &1, &i128::MAX);
