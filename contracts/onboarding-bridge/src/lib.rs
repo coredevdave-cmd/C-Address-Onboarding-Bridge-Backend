@@ -1,3 +1,55 @@
+//! # Onboarding Bridge — Soroban Smart Contract
+//!
+//! Routes funds from G-addresses and CEX withdrawals directly into Soroban
+//! smart accounts (C-addresses), removing the requirement for users to hold a
+//! traditional Stellar account before interacting with Soroban dApps.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! G-Address / CEX  ──▶  OnboardingBridge  ──▶  C-Address (target)
+//!                              │
+//!                        fee deducted
+//!                              │
+//!                       AccumulatedFees
+//! ```
+//!
+//! The contract itself does **not** move tokens; callers perform the actual
+//! token transfer off-chain (or via a separate SAC call) and invoke
+//! [`OnboardingBridge::fund_c_address`] to record the event and accrue fees.
+//!
+//! ## Fee Model
+//!
+//! Fees are expressed in **basis points** (bps), where 1 bps = 0.01 %.
+//!
+//! ```text
+//! fee_amount = floor(amount × fee_bps / 10_000)
+//! net_amount = amount − fee_amount
+//! ```
+//!
+//! Fees accumulate in [`DataKey::AccumulatedFees`] and can be withdrawn via
+//! `withdraw_fees` (admin, single or multi-recipient) or
+//! automatically via `trigger_auto_withdraw` (permissionless,
+//! fires when accumulated ≥ threshold).
+//!
+//! Multi-recipient splits are configured through
+//! `set_fee_recipients`; each recipient's share must be
+//! given in bps and all shares must sum to exactly 10 000.  The **last**
+//! recipient always receives the remainder to absorb integer-division dust.
+//!
+//! ## Storage Layout
+//!
+//! All keys live in **instance** storage (contract lifetime):
+//!
+//! | Key                    | Type            | Description                         |
+//! |------------------------|-----------------|-------------------------------------|
+//! | `Admin`                | `Address`       | Contract administrator              |
+//! | `FeeBps`               | `u32`           | Current fee rate (0–10 000)         |
+//! | `AccumulatedFees`      | `i128`          | Total unclaimed fees (stroops)      |
+//! | `Version`              | `u32`           | Contract schema version             |
+//! | `FeeRecipients`        | `Vec<FeeRecipient>` | Optional multi-recipient split  |
+//! | `AutoWithdrawThreshold`| `i128`          | Auto-withdraw trigger level; 0 = off|
+
 #![no_std]
 #![allow(deprecated)]
 #![allow(clippy::needless_borrows_for_generic_args)]
@@ -17,12 +69,16 @@ const ERR_MISMATCHED_LENGTHS: &str = "batch input vectors must have same length"
 const ERR_NO_ENTRIES_TO_ARCHIVE: &str = "no entries to archive";
 const ERR_ADMIN_CANNOT_BE_CONTRACT: &str = "admin address cannot be the contract address";
 
+/// Storage keys used throughout the contract.
+///
+/// Every variant maps to a distinct slot in instance storage.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     FeeBps,
     MaxFeeBps,
     AccumulatedFees,
+    /// Logical contract version (user-visible, incremented on each upgrade).
     Version,
     Paused,
     Admins,
@@ -200,9 +256,7 @@ impl OnboardingBridge {
             .instance()
             .set(&DataKey::MaxFeeBps, &max_fee_bps);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-        env.storage()
-            .instance()
-            .set(&DataKey::AccumulatedFees, &0i128);
+        env.storage().instance().set(&DataKey::AccumulatedFees, &0i128);
         env.storage().instance().set(&DataKey::Version, &1u32);
         env.storage().instance().set(
             &DataKey::InitializationParams,
@@ -236,6 +290,10 @@ impl OnboardingBridge {
             ),
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Getters
+    // -----------------------------------------------------------------------
 
     pub fn version(env: Env) -> u32 {
         Self::extend_ttl(&env);
@@ -316,6 +374,17 @@ impl OnboardingBridge {
         rebate_bps(&env, &user)
     }
 
+    /// Returns the total unclaimed fees accumulated in the contract (stroops).
+    ///
+    /// # Returns
+    ///
+    /// Running fee balance as `i128`, or `0` if none have been collected.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let fees = contract.accumulated_fees(env);
+    /// ```
     pub fn accumulated_fees(env: Env) -> i128 {
         Self::extend_ttl(&env);
         env.storage()
@@ -542,6 +611,37 @@ impl OnboardingBridge {
         (total_fees, count)
     }
 
+    /// Route a CEX withdrawal to a C-address.
+    ///
+    /// Convenience wrapper around `fund_c_address` that requires the calling
+    /// exchange address to authorise the transaction, then delegates all fee
+    /// logic and event emission to `fund_c_address`.
+    ///
+    /// # Parameters
+    ///
+    /// - `exchange` — Authorised exchange address initiating the withdrawal.
+    /// - `target` — Destination C-address.
+    /// - `token_address` — Token being transferred.
+    /// - `amount` — Gross transfer amount.
+    /// - `memo` — Memo for off-chain tracking (format: `bridge:{exchange}:{suffix}`).
+    ///
+    /// # Returns
+    ///
+    /// Fee amount deducted (see `fund_c_address`).
+    ///
+    /// # Panics
+    ///
+    /// - Auth failure — if the transaction is not signed by `exchange`.
+    ///
+    /// # Events
+    ///
+    /// Emits `("funded",) → (exchange, target, amount, fee_amount)` (via `fund_c_address`).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let fee = contract.route_from_exchange(env, exchange, target, token, 10_000_000, memo);
+    /// ```
     pub fn route_from_exchange(
         env: Env,
         exchange: Address,
